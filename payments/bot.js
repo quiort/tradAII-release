@@ -957,8 +957,8 @@ async function runCheck() {
 
 async function main() {
   if (process.argv.includes('--check')) return runCheck();
-  if (!BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is not set.');
-  if (!PRIVATE_KEY) throw new Error('LICENSE_PRIVATE_KEY is not set.');
+  if (!BOT_TOKEN) { console.log('TELEGRAM_BOT_TOKEN is not set yet; skipping this run.'); return; }
+  if (!PRIVATE_KEY) { console.log('LICENSE_PRIVATE_KEY is not set yet; skipping this run.'); return; }
   const state = readState();
   const config = await loadConfig();
 
