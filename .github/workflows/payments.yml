@@ -1,0 +1,49 @@
+# Automatic TradAI Pro keys from crypto payments.
+# Buyers pay, send the transaction ID to the bot, and this workflow checks the chain and
+# replies with a signed key. It lives in the public releases repo so scheduled runs are free.
+name: Payments
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: payments
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Setup check
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          LICENSE_PRIVATE_KEY: ${{ secrets.LICENSE_PRIVATE_KEY }}
+        run: node payments/bot.js --check
+
+      - name: Check payments
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          LICENSE_PRIVATE_KEY: ${{ secrets.LICENSE_PRIVATE_KEY }}
+        run: node payments/bot.js
+
+      - name: Save payment state
+        run: |
+          git config user.name "TradAI payments"
+          git config user.email "payments@users.noreply.github.com"
+          git add payments/state.json
+          git diff --cached --quiet && { echo "No state change"; exit 0; }
+          git commit -m "Payments state $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
