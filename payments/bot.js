@@ -120,7 +120,7 @@ function normalizePayment(raw = {}, { strict = false } = {}) {
     const label = text(item?.label, 40); const price = Number(item?.price); const months = Number(item?.months);
     if (!label && !item?.price) continue;
     if (!label || !(price > 0) || price > 100000 || !(months > 0) || months > 120) { if (fail(`Plan ${i + 1}: needs a name, a price above 0 and a length in months.`) === null && !strict) continue; }
-    plans.push({ id: text(item?.id, 24) || `plan${i + 1}`, label, price: Math.round(price * 100) / 100, months: Math.round(months), currency: text(item?.currency, 10).toUpperCase() || 'USDT' });
+    plans.push({ id: text(item?.id, 24) || `plan${i + 1}`, label, price: Math.round(price * 100) / 100, months: Math.round(months), currency: text(item?.currency, 10).toUpperCase() || 'USDT', oxapayLink: /^https:\/\/(?:[a-z0-9-]+\.)*oxapay\.com\/[^\s]*$/i.test(text(item?.oxapayLink, 300)) ? text(item?.oxapayLink, 300) : '' });
   }
   const telegram = text(raw.contact?.telegram, 40).replace(/^@/, '').replace(/^(?:https?:\/\/)?t\.me\//i, '');
   const bot = text(raw.contact?.bot, 40).replace(/^@/, '').replace(/^(?:https?:\/\/)?t\.me\//i, '').replace(/\/.*$/, '');
@@ -144,27 +144,31 @@ function normalizePayment(raw = {}, { strict = false } = {}) {
 }
 
 /** The message a buyer sends the owner after paying (manual flow). */
-function proofMessage({ plan, wallet, txId, email }) {
+function proofMessage({ plan, wallet, txId, email, provider = 'chain' }) {
   return [
     'TradAI Pro payment',
     `Plan: ${plan?.label || '—'} (${plan ? `${plan.price} ${plan.currency}` : '—'})`,
-    `Paid with: ${wallet?.label || '—'}${wallet?.network ? ` · ${wallet.network}` : ''}`,
-    `Transaction ID: ${text(txId, 200) || '—'}`,
+    provider === 'oxapay'
+      ? 'Paid with: OxaPay'
+      : `Paid with: ${wallet?.label || '—'}${wallet?.network ? ` · ${wallet.network}` : ''}`,
+    provider === 'oxapay'
+      ? `OxaPay payment ID: ${text(txId, 200) || '—'}`
+      : `Transaction ID: ${text(txId, 200) || '—'}`,
     `My TradAI email: ${text(email, 120) || '—'}`,
   ].join('\n');
 }
 
 /** The message the payment bot understands. Keep the keys stable: the bot parses them. */
-function botProofMessage({ plan, wallet, txId, email }) {
-  return [
-    '/paid',
-    `plan: ${plan?.id || ''}`,
-    `to: ${wallet?.address || ''}`,
-    `chain: ${walletChain(wallet) || ''}`,
-    `tx: ${text(txId, 200)}`,
-    `email: ${text(email, 120)}`,
-  ].join('\n');
+function botProofMessage({ plan, wallet, txId, email, provider = 'chain', trackId = '' }) {
+  const lines = ['/paid', `provider: ${provider === 'oxapay' ? 'oxapay' : 'chain'}`, `plan: ${plan?.id || ''}`];
+  if (provider === 'oxapay') lines.push(`track: ${text(trackId, 200)}`, `tx: ${text(txId, 200)}`);
+  else lines.push(`to: ${wallet?.address || ''}`, `chain: ${walletChain(wallet) || ''}`, `tx: ${text(txId, 200)}`);
+  lines.push(`email: ${text(email, 120)}`);
+  return lines.join('\n');
 }
+
+/** True when the plan has an OxaPay checkout link (the owner added one). */
+function hasOxapay(plan) { return Boolean(String(plan?.oxapayLink || '').trim()); }
 
 /** Links that open the payment bot, the owner's Telegram chat, or an email with the proof filled in. */
 function proofLinks(config, message) {
@@ -177,7 +181,7 @@ function proofLinks(config, message) {
 
 module.exports = {
   MAX_WALLETS, MAX_PLANS, CHAINS, normalizeChain, detectChain, walletChain,
-  normalizePayment, proofMessage, botProofMessage, proofLinks,
+  normalizePayment, proofMessage, botProofMessage, proofLinks, hasOxapay,
 };
 
 };
@@ -552,6 +556,147 @@ module.exports = { STABLES, TOKENS, verifyPayment, usdPrice, verifyEvm, verifyTr
 
 };
 
+__modules["oxapay"] = function (module, exports, require) {
+'use strict';
+// Checks crypto payments handled by OxaPay (any coin, any network the gateway supports).
+// The payment bot asks the OxaPay API for a payment: by track ID when the buyer sent one,
+// or by scanning the merchant payment history for the transaction hash. The merchant API key
+// lives in the GitHub Actions secret, so no key is ever needed on the buyer side.
+// Used by scripts/payment-bot.js and covered by test/oxapay.test.js.
+
+const OXAPAY_API = 'https://api.oxapay.com';
+const STABLES = new Set(['USD', 'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'USDP', 'USDD', 'PYUSD', 'EURC', 'EURT']);
+const ACCEPTED = new Set(['paid', 'manual_accept']);
+const WATCH = new Set(['new', 'waiting', 'paying', 'confirming', 'pending']);
+const DENIED = new Set(['underpaid', 'expired', 'refunded', 'refunding', 'failed', 'canceled', 'cancelled']);
+
+const { usdPrice } = __require('payment-verify');
+
+function defaultFetchJson(url, options = {}) {
+  return fetch(url, { headers: { 'User-Agent': 'TradAI payments', ...(options.headers || {}) }, signal: AbortSignal.timeout(20000), ...options })
+    .then(async (res) => {
+      if (!res.ok) { const body = await res.text().catch(() => ''); throw new Error(`HTTP ${res.status} ${String(body).slice(0, 120)}`); }
+      return res.json();
+    });
+}
+
+function normalizePayment(raw = {}) {
+  const txs = Array.isArray(raw?.txs) ? raw.txs.map((t) => ({
+    hash: String(t?.tx_hash || t?.txHash || t?.hash || ''),
+    amount: Number(t?.sent_amount ?? t?.amount ?? 0),
+    currency: String(t?.currency || '').toUpperCase(),
+    network: String(t?.network || ''),
+    address: String(t?.address || t?.to || ''),
+    status: String(t?.status || '').toLowerCase(),
+    confirmations: Number(t?.confirmations || 0),
+  })) : [];
+  return {
+    trackId: String(raw?.track_id || raw?.trackId || ''),
+    status: String(raw?.status || '').toLowerCase(),
+    type: String(raw?.type || ''),
+    amount: Number(raw?.amount ?? raw?.payAmount ?? 0),
+    currency: String(raw?.currency || '').toUpperCase(),
+    payAmount: Number(raw?.payAmount ?? raw?.amount ?? 0),
+    payCurrency: String(raw?.payCurrency || raw?.currency || '').toUpperCase(),
+    orderId: String(raw?.order_id || raw?.orderId || ''),
+    email: String(raw?.email || '').trim().toLowerCase(),
+    description: String(raw?.description || ''),
+    date: Number(raw?.date || 0),
+    txs,
+  };
+}
+
+function sameHash(a, b) {
+  const norm = (value) => String(value ?? '').replace(/^0x/, '').trim().toLowerCase();
+  const x = norm(a); const y = norm(b);
+  if (!x || !y) return true; // Unknown identifiers cannot be rejected as a mismatch.
+  return x === y;
+}
+
+/** Payment by OxaPay track ID (the flow buyers get from an OxaPay invoice / checkout). */
+async function getPayment({ merchantKey, trackId, deps = {} } = {}) {
+  const fetchJson = deps.fetchJson || defaultFetchJson;
+  let data = null;
+  try {
+    data = await fetchJson(`${OXAPAY_API}/v1/payment/${encodeURIComponent(String(trackId || ''))}`, { headers: { merchant_api_key: merchantKey } });
+  } catch { data = null; }
+  if (data && data.data) return normalizePayment(data.data);
+  const legacy = await fetchJson(`${OXAPAY_API}/merchants/inquiry`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ merchant: merchantKey, trackId }),
+  });
+  if (!legacy || legacy.result !== 100) throw new Error((legacy && legacy.message) || 'OxaPay could not find that payment.');
+  return normalizePayment({
+    ...legacy,
+    txs: legacy.txID ? [{ hash: legacy.txID, amount: legacy.payAmount, currency: legacy.payCurrency, network: legacy.network }] : [],
+  });
+}
+
+/** Looks a transaction hash up in the merchant payment history (used when only the tx is known). */
+async function findPaymentByTxHash({ merchantKey, txId, deps = {}, now = Date.now() } = {}) {
+  const fetchJson = deps.fetchJson || defaultFetchJson;
+  const to = Math.floor(now / 1000);
+  const from = Math.floor(now / 1000) - 30 * 86400;
+  for (let page = 1; page <= 5; page += 1) {
+    const data = await fetchJson(`${OXAPAY_API}/v1/payment?from_date=${from}&to_date=${to}&sort_by=pay_date&sort_type=desc&page=${page}&size=200`, { headers: { merchant_api_key: merchantKey } });
+    const list = Array.isArray(data?.data?.list) ? data.data.list : [];
+    for (const item of list) {
+      const payment = normalizePayment(item);
+      if (payment.txs.some((t) => sameHash(t.hash, txId))) return payment;
+    }
+    const lastPage = Number(data?.data?.meta?.last_page || 1);
+    if (page >= lastPage) break;
+  }
+  return null;
+}
+
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
+
+/**
+ * Verifies a TradAI Pro payment that went through OxaPay.
+ * @returns {Promise<{status:'accepted'|'denied'|'pending', reason?:string, plan?:object, payment?:object, asset?:string, amount?:number, usd?:number}>}
+ */
+async function verifyOxapay({ proof = {}, config, merchantKey = '', now = Date.now(), deps = {} } = {}) {
+  const planId = String(proof.planId || '').trim();
+  const plan = (config?.plans || []).find((item) => item.id === planId || item.label.toLowerCase() === planId.toLowerCase());
+  if (!plan) return { status: 'denied', reason: 'I can\'t match that plan. Open TradAI → Get Pro and send the proof from there so the details match.' };
+  if (!merchantKey) return { status: 'denied', reason: 'OxaPay is not connected yet. Ask the owner to add the OxaPay merchant key.' };
+  const txId = String(proof.txId || '').trim();
+  const trackId = String(proof.trackId || '').trim();
+  if (!txId && !trackId) return { status: 'denied', reason: 'Send the OxaPay payment ID or transaction ID.' };
+
+  let payment = null;
+  try {
+    payment = trackId ? await getPayment({ merchantKey, trackId, deps }) : await findPaymentByTxHash({ merchantKey, txId, deps, now });
+  } catch (error) {
+    return { status: 'pending', reason: `I could not reach OxaPay just now (${error.message}). I will try again.` };
+  }
+  if (!payment) return { status: 'pending', reason: 'I could not find that payment on OxaPay yet.' };
+
+  const status = String(payment.status || '').toLowerCase();
+  if (!ACCEPTED.has(status)) {
+    if (WATCH.has(status)) return { status: 'pending', reason: `OxaPay says the payment is "${status}". I will keep checking for it.`, payment };
+    if (status === 'underpaid') return { status: 'denied', reason: `OxaPay says the payment is underpaid (${payment.amount} ${payment.currency}). Send the missing amount and submit the new transaction.`, payment };
+    if (DENIED.has(status)) return { status: 'denied', reason: `OxaPay says the payment is ${status}, so it was not accepted.`, payment };
+    return { status: 'denied', reason: `OxaPay says the payment is ${status || 'not completed'}, so it was not accepted.`, payment };
+  }
+
+  const currency = String(payment.currency || '').toUpperCase();
+  const unitPrice = STABLES.has(currency) ? 1 : await usdPrice(currency, { token: payment.txs[0]?.token }, deps);
+  if (!unitPrice) return { status: 'denied', reason: `I received ${payment.amount} ${currency} from OxaPay, but I cannot price it automatically. Pay in USD or USDT.`, payment };
+  const usd = payment.amount * unitPrice;
+  const needed = Number(plan.price);
+  if (usd < needed * 0.98) return { status: 'denied', reason: `I see ${usd.toFixed(2)} USD (${payment.amount} ${currency}) on OxaPay, but ${plan.label} costs ${needed} ${plan.currency || 'USDT'}. Send the difference and submit the new transaction.`, payment };
+  if (payment.email && proof.email && payment.email !== proof.email) return { status: 'denied', reason: 'That OxaPay payment belongs to another TradAI email. Send the proof again from the app.', payment };
+  const txHash = payment.txs[0]?.hash || txId;
+  if (txId && payment.txs.length && !payment.txs.some((t) => sameHash(t.hash, txId))) return { status: 'denied', reason: 'I could not match that transaction to the OxaPay payment.', payment };
+  return { status: 'accepted', provider: 'oxapay', chain: 'oxapay', plan, payment, txId: txHash, asset: currency, amount: payment.amount, usd: round2(usd), price: unitPrice, confirmations: payment.txs[0]?.confirmations || 0, reason: `OxaPay payment confirmed: ${payment.amount} ${currency} (${usd.toFixed(2)} USD).` };
+}
+
+module.exports = { OXAPAY_API, STABLES, ACCEPTED, WATCH, DENIED, normalizePayment, sameHash, getPayment, findPaymentByTxHash, verifyOxapay, round2 };
+
+};
+
 __modules["license"] = function (module, exports, require) {
 'use strict';
 // TradAI Pro licensing: Ed25519-signed keys, verified offline.
@@ -635,13 +780,14 @@ module.exports = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2M7RwdVoAQAkHZTE3m
 
 __modules["bot"] = function (module, exports, require) {
 'use strict';
-// TradAI payment bot: reads Telegram messages, checks the payment on-chain and replies
-// with a signed Pro key (or the reason it was refused). Runs on a schedule (GitHub
-// Actions) or locally with `npm run payments:bot`.
+// TradAI payment bot: reads Telegram messages, checks the payment (on-chain crypto wallet or
+// through OxaPay) and replies with a signed Pro key (or the reason it was refused). Runs on a
+// schedule (GitHub Actions) or locally with `npm run payments:bot`.
 //
 // Needs:
 //   TELEGRAM_BOT_TOKEN      from @BotFather
 //   LICENSE_PRIVATE_KEY     the PEM in license-keys/private.pem (same key the app trusts)
+//   OXAPAY_MERCHANT_KEY     OxaPay merchant API key (only for OxaPay payments)
 //   payment.json            published by the Admin panel (wallets, plans, contact.bot)
 //   payments/state.json     last update id, used transactions, pending checks
 //
@@ -652,6 +798,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { normalizePayment, walletChain } = __require('payment');
 const { verifyPayment } = __require('payment-verify');
+const { verifyOxapay } = __require('oxapay');
 const { signLicense, verifyLicense } = __require('license');
 const PUBLIC_KEY = __require('license-public-key');
 
@@ -661,6 +808,7 @@ const CONFIG_URL = process.env.PAYMENT_CONFIG_URL || '';
 const STATE_FILE = process.env.PAYMENTS_STATE_FILE || path.join(ROOT, 'payments', 'state.json');
 const BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const PRIVATE_KEY = String(process.env.LICENSE_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim();
+const OXAPAY_KEY = String(process.env.OXAPAY_MERCHANT_KEY || '').trim();
 const MAX_PENDING = 50;
 const PENDING_HOURS = 24;
 const RATE_LIMIT = 6;
@@ -729,10 +877,12 @@ const HELP = [
   'TradAI payments — automatic Pro keys.',
   '',
   '1. In TradAI, open Get Pro → choose a plan → pay with crypto.',
-  '2. Paste the transaction ID and press the button that opens this bot.',
-  '3. Send the message. I check the blockchain and reply with your Pro key in a few minutes.',
+  '2. Paste the transaction ID (or the OxaPay payment ID) and press the button that opens this bot.',
+  '3. Send the message. I check the payment and reply with your Pro key in a few minutes.',
   '',
-  'Always send the proof from the app: I need the plan, wallet and your TradAI email to match.',
+  'If you paid with OxaPay, the transaction ID is the payment hash from the OxaPay page or your wallet; I check it there instead of a personal wallet.',
+  '',
+  'Always send the proof from the app: I need the plan and your TradAI email to match.',
 ].join('\n');
 
 /** Parses `/paid` plus `key: value` lines (or inline key=value pairs). */
@@ -751,13 +901,31 @@ function parseProof(text) {
     address: fields.to || fields.wallet || fields.address || '',
     chain: fields.chain || fields.network || '',
     txId: fields.tx || fields.txid || fields.hash || fields.transaction || '',
+    trackId: fields.track || fields.trackid || fields.track_id || '',
     email: String(fields.email || '').trim().toLowerCase(),
+    provider: String(fields.provider || 'chain').toLowerCase(),
   };
 }
 
 function validEmail(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '')); }
 
 function usedKey(chain, txId) { return `${chain}:${String(txId || '').toLowerCase()}`; }
+
+/** Replay protection key: on OxaPay the payment is bound to the track ID / transaction hash. */
+function usedKeyFor(result, proof = {}) {
+  const provider = String(result?.provider || proof?.provider || 'chain').toLowerCase();
+  const id = String(result?.txId || proof.txId || proof.trackId || '').trim().toLowerCase();
+  if (provider === 'oxapay') return `oxapay:${id}`;
+  const chain = result?.chain || walletChain(result?.wallet);
+  return usedKey(chain, proof.txId);
+}
+
+/** Routes a proof to the right checker (on-chain crypto wallets or OxaPay). */
+async function verifyProof({ proof = {}, config, now = Date.now() } = {}) {
+  const provider = String(proof.provider || 'chain').toLowerCase();
+  if (provider === 'oxapay') return verifyOxapay({ proof, config, merchantKey: OXAPAY_KEY, now });
+  return verifyPayment({ proof, config, now });
+}
 
 function issueKey(email, months) {
   if (!PRIVATE_KEY) throw new Error('LICENSE_PRIVATE_KEY is not set.');
@@ -814,17 +982,16 @@ function rateLimited(state, chatId) {
 async function processProof(state, config, proof, chatId) {
   if (!config) return { status: 'denied', reason: 'Payments are not open yet. The owner has not published the payment settings.' };
   if (!validEmail(proof.email)) return { status: 'denied', reason: 'The TradAI email is missing. Send the proof from the app so it is included.' };
-  if (!proof.txId) return { status: 'denied', reason: 'The transaction ID is missing.' };
-  const result = await verifyPayment({ proof, config });
+  if (!proof.txId && !proof.trackId) return { status: 'denied', reason: 'The transaction ID is missing.' };
+  const result = await verifyProof({ proof, config });
   if (result.status !== 'accepted') return result;
 
-  const chain = result.chain || walletChain(result.wallet);
-  const key = usedKey(chain, proof.txId);
+  const key = usedKeyFor(result, proof);
   if (state.used[key]) {
     return { status: 'denied', reason: `That transaction was already used for a key on ${String(state.used[key].at || '').slice(0, 10)}.` };
   }
   const issued = issueKey(proof.email, result.plan.months);
-  state.used[key] = { email: proof.email, plan: result.plan.id, at: nowIso(), usd: result.usd, asset: result.asset, amount: result.amount, keyId: crypto.createHash('sha256').update(issued.key).digest('hex').slice(0, 12) };
+  state.used[key] = { email: proof.email, plan: result.plan.id, provider: String(result.provider || proof.provider || 'chain'), at: nowIso(), usd: result.usd, asset: result.asset, amount: result.amount, keyId: crypto.createHash('sha256').update(issued.key).digest('hex').slice(0, 12) };
   return { ...result, issued };
 }
 
@@ -839,11 +1006,10 @@ async function checkPending(state, config) {
       changed = true;
       continue;
     }
-    const proof = { planId: item.planId, address: item.address, chain: item.chain, txId: item.txId, email: item.email };
-    const result = await verifyPayment({ proof, config });
+    const proof = { planId: item.planId, address: item.address, chain: item.chain, txId: item.txId, trackId: item.trackId || '', email: item.email, provider: item.provider || 'chain' };
+    const result = await verifyProof({ proof, config });
     if (result.status === 'accepted') {
-      const chain = result.chain || walletChain(result.wallet);
-      const key = usedKey(chain, item.txId);
+      const key = usedKeyFor(result, proof);
       if (state.used[key]) {
         await reply(item.chatId, deniedReply({ reason: 'That transaction was already used for a key.' }));
       } else {
@@ -899,11 +1065,14 @@ async function handleUpdate(state, config, update) {
     await reply(chatId, HELP);
     return;
   }
-  if (state.used[`${proof.chain || ''}:${String(proof.txId).toLowerCase()}`] || Object.keys(state.used).some((key) => key.endsWith(`:${String(proof.txId).toLowerCase()}`))) {
+  const providerKey = String(proof.provider || 'chain').toLowerCase();
+  const usedPrefix = providerKey === 'oxapay' ? 'oxapay' : String(proof.chain || 'chain');
+  const usedKeyStr = `${usedPrefix}:${String(proof.txId || '').toLowerCase()}`;
+  if (state.used[usedKeyStr] || Object.keys(state.used).some((key) => key.endsWith(`:${String(proof.txId || '').toLowerCase()}`))) {
     await reply(chatId, deniedReply({ reason: 'That transaction was already used for a key.' }));
     return;
   }
-  if (state.pending.some((item) => String(item.chatId) === String(chatId) && String(item.txId).toLowerCase() === String(proof.txId).toLowerCase())) {
+  if (state.pending.some((item) => String(item.chatId) === String(chatId) && String(item.provider || 'chain').toLowerCase() === providerKey && String(item.txId).toLowerCase() === String(proof.txId || '').toLowerCase())) {
     await reply(chatId, '⏳ I am already checking that transaction. I will reply here when it confirms.');
     return;
   }
@@ -929,7 +1098,7 @@ async function handleUpdate(state, config, update) {
     await reply(chatId, deniedReply(result));
     return;
   }
-  state.pending.push({ chatId, planId: proof.planId, address: proof.address, chain: proof.chain, txId: proof.txId, email: proof.email, firstSeen: nowIso() });
+  state.pending.push({ chatId, planId: proof.planId, address: proof.address, chain: proof.chain, txId: proof.txId, trackId: proof.trackId || '', email: proof.email, provider: proof.provider || 'chain', firstSeen: nowIso() });
   await reply(chatId, pendingReply(result));
   writeState(state);
 }
@@ -944,6 +1113,13 @@ async function runCheck() {
       const test = issueKey('setup-check@example.com', 1);
       lines.push(`signing key: matches the app (test key valid until ${test.exp.slice(0, 10)})`);
     } catch (error) { lines.push(`signing key: INVALID (${error.message})`); }
+  }
+  lines.push(`oxapay merchant key: ${OXAPAY_KEY ? 'set' : 'MISSING'}`);
+  if (OXAPAY_KEY) {
+    try {
+      const probe = await verifyOxapay({ proof: { planId: 'month', txId: '0x00', email: 'setup-check@example.com', provider: 'oxapay' }, config: { plans: [{ id: 'month', label: 'Monthly', price: 20, months: 1 }] }, merchantKey: OXAPAY_KEY });
+      lines.push(`oxapay: reachable (${probe.status}${probe.reason ? ` — ${probe.reason}` : ''})`);
+    } catch (error) { lines.push(`oxapay: unreachable (${error.message})`); }
   }
   lines.push(`payment config: ${config ? `${config.wallets.length} wallet(s), ${config.plans.length} plan(s), bot ${config.contact.bot || 'MISSING'}` : 'MISSING'}`);
   if (config) {
@@ -989,7 +1165,7 @@ if (require.main === module) {
   main().catch((error) => { console.error(error.message); process.exitCode = 1; });
 }
 
-module.exports = { parseProof, defaultState, issueKey, validEmail, usedKey, HELP, main };
+module.exports = { parseProof, defaultState, issueKey, validEmail, usedKey, usedKeyFor, verifyProof, HELP, main };
 
 };
 
