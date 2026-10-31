@@ -31,12 +31,14 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           LICENSE_PRIVATE_KEY: ${{ secrets.LICENSE_PRIVATE_KEY }}
+          OXAPAY_MERCHANT_KEY: ${{ secrets.OXAPAY_MERCHANT_KEY }}
         run: node payments/bot.js --check
 
       - name: Check payments
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           LICENSE_PRIVATE_KEY: ${{ secrets.LICENSE_PRIVATE_KEY }}
+          OXAPAY_MERCHANT_KEY: ${{ secrets.OXAPAY_MERCHANT_KEY }}
         run: node payments/bot.js
 
       - name: Save payment state
