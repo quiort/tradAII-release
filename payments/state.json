@@ -1,8 +1,24 @@
 {
   "version": 1,
-  "lastUpdateId": 352564691,
+  "lastUpdateId": 352564692,
   "used": {},
-  "pending": [],
-  "chats": {},
-  "updatedAt": "2026-11-02T15:10:36.346Z"
+  "pending": [
+    {
+      "chatId": 1236798389,
+      "planId": "month",
+      "address": "",
+      "chain": "",
+      "txId": "Any crypto in any network OxaPay accepts. You pick the coin at checkout; OxaPay holds the payment until it is confirmed.",
+      "trackId": " ",
+      "email": "zisou555@gmail.com",
+      "provider": "oxapay",
+      "firstSeen": "2026-11-02T15:11:55.094Z"
+    }
+  ],
+  "chats": {
+    "1236798389": [
+      1793632314621
+    ]
+  },
+  "updatedAt": "2026-11-02T15:11:55.440Z"
 }
