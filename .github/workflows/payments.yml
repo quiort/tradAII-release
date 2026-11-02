@@ -18,7 +18,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v5
 
@@ -34,18 +34,24 @@ jobs:
           OXAPAY_MERCHANT_KEY: ${{ secrets.OXAPAY_MERCHANT_KEY }}
         run: node payments/bot.js --check
 
-      - name: Check payments
+      # GitHub runs the 5-minute schedule only every few hours, so each run keeps the bot
+      # answering for almost 6 hours (a check every 20 s) and saves state after each change.
+      - name: Answer the bot for up to 5h50
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           LICENSE_PRIVATE_KEY: ${{ secrets.LICENSE_PRIVATE_KEY }}
           OXAPAY_MERCHANT_KEY: ${{ secrets.OXAPAY_MERCHANT_KEY }}
-        run: node payments/bot.js
-
-      - name: Save payment state
         run: |
           git config user.name "TradAI payments"
           git config user.email "payments@users.noreply.github.com"
-          git add payments/state.json
-          git diff --cached --quiet && { echo "No state change"; exit 0; }
-          git commit -m "Payments state $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push
+          end=$((SECONDS + 5*3600 + 50*60))
+          while [ $SECONDS -lt $end ]; do
+            node payments/bot.js || echo "bot pass failed, retrying"
+            # Commit only real changes, not the timestamp the bot writes on every pass
+            if git diff -U0 -- payments/state.json | grep -E '^[+-][^+-]' | grep -qv '"updatedAt"'; then
+              git add payments/state.json
+              git commit -q -m "Payments state $(date -u +%Y-%m-%dT%H:%MZ)"
+              git pull -q --rebase origin main && git push -q || echo "state push failed, will retry"
+            fi
+            sleep 20
+          done
