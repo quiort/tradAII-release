@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-02T15:03:57.359Z",
+  "wallets": [],
+  "plans": [
+    {
+      "id": "month",
+      "label": "Monthly",
+      "price": 20,
+      "months": 1,
+      "currency": "USDT",
+      "oxapayLink": "https://pay.oxapay.com/16372736"
+    }
+  ],
+  "contact": {
+    "telegram": "",
+    "bot": "trad_AIbot",
+    "email": ""
+  },
+  "instructions": ""
+}
